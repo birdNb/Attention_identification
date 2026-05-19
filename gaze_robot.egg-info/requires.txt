@@ -1,0 +1,5 @@
+numpy
+opencv-python==4.8.1.78
+pillow
+mediapipe==0.10.9
+onnxruntime

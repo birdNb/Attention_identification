@@ -1,0 +1,3 @@
+[console_scripts]
+gaze-camera-test = test_camera:main
+gaze-robot = gaze_robot:main

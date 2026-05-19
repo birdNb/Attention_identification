@@ -1,0 +1,16 @@
+Metadata-Version: 2.1
+Name: gaze_robot
+Version: 0.1.0
+Summary: Jetson Orin Nano 注视识别工程（人脸 + 瞳孔 + 是否注视相机）
+Author: bird
+License: MIT
+Classifier: Programming Language :: Python :: 3
+Classifier: Programming Language :: Python :: 3.8
+Classifier: Operating System :: POSIX :: Linux
+Classifier: Topic :: Scientific/Engineering :: Image Recognition
+Requires-Python: >=3.8
+Requires-Dist: numpy
+Requires-Dist: opencv-python==4.8.1.78
+Requires-Dist: pillow
+Requires-Dist: mediapipe==0.10.9
+Requires-Dist: onnxruntime
