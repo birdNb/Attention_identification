@@ -35,6 +35,11 @@ PUPIL_Y_BASE = 0.42
 PUPIL_Y_TOL = 0.20
 # 持续注视触发时间
 GAZE_HOLD_SECONDS = 2.0
+# ===================== 终端日志 =====================
+# 终端状态报告打印间隔（秒）
+LOG_INTERVAL = 1.0
+# 是否启用 ANSI 彩色输出（重定向到文件请设 False）
+USE_ANSI_COLOR = True
 # ===================== 跟踪增强 =====================
 # 远距离 / 快速运动跟丢时，启用 Face Detection 重新定位 ROI
 ENABLE_ROI_FALLBACK = True
@@ -417,6 +422,91 @@ def draw_top_right(frame, lines, scale=0.7, color=(0, 255, 0),
         y += th + line_gap
 
 
+# ===================== 终端日志（ANSI 彩色） =====================
+_ANSI = {
+    "reset":    "\033[0m",
+    "bold":     "\033[1m",
+    "dim":      "\033[2m",
+    "red":      "\033[91m",
+    "green":    "\033[92m",
+    "yellow":   "\033[93m",
+    "cyan":     "\033[96m",
+    "magenta":  "\033[95m",
+    "gray":     "\033[90m",
+    "bg_green": "\033[42;30m",
+    "bg_red":   "\033[41;97m",
+}
+
+
+def _c(text: str, *styles: str) -> str:
+    """根据样式名组合 ANSI 颜色，重定向到文件时自动降级为纯文本。"""
+    if not USE_ANSI_COLOR:
+        return text
+    return "".join(_ANSI[s] for s in styles) + text + _ANSI["reset"]
+
+
+def _badge(ok: bool) -> str:
+    """状态徽章：通过 -> 绿色 ' OK ' / 未通过 -> 红色 'MISS'。"""
+    if ok:
+        return _c(" OK ", "bold", "green")
+    return _c("MISS", "bold", "red")
+
+
+def print_status_report(info, used_roi, locked, elapsed, hold_target,
+                        fps, cpu, gpu):
+    """在终端打印一帧多行状态报告（每 LOG_INTERVAL 秒调用一次）。"""
+    ts = time.strftime("%H:%M:%S")
+    bar = _c("─" * 66, "gray")
+
+    head_left = _c(f"[{ts}]", "cyan", "bold")
+    gpu_s = f"{gpu:5.1f}%" if gpu is not None else " N/A "
+    head_right = (
+        f"FPS {fps:5.1f}   CPU {cpu:5.1f}%   GPU {gpu_s}"
+    )
+    roi_tag = f"   {_c('[ROI]', 'yellow', 'bold')}" if used_roi else ""
+
+    print()
+    print(bar)
+    print(f" {head_left}   {head_right}{roi_tag}")
+    print(bar)
+
+    if info is None:
+        print(
+            f"  Face detected     {_badge(False)}   "
+            + _c("no face in frame", "gray")
+        )
+        print(f"  Face orientation  {_badge(False)}")
+        print(f"  Pupil centered    {_badge(False)}")
+        print(f"  Gaze locked       {_badge(False)}")
+    else:
+        face_ok = info["face_ok"]
+        pupil_ok = info["pupil_ok"]
+
+        print(f"  Face detected     {_badge(True)}")
+        print(
+            f"  Face orientation  {_badge(face_ok)}   "
+            f"yaw={info['yaw']:+.2f}  pitch={info['pitch']:.2f}"
+        )
+        print(
+            f"  Pupil centered    {_badge(pupil_ok)}   "
+            f"px={info['px_dev']:.2f}  py={info['py_dev']:.2f}"
+        )
+        if locked:
+            big = _c("  LOOKING AT CAMERA  ", "bg_green", "bold")
+            print(
+                f"  Gaze locked       {_badge(True)}   "
+                f">= {hold_target:.1f}s   {big}"
+            )
+        elif face_ok and pupil_ok:
+            wait = _c("WAIT", "bold", "yellow")
+            print(
+                f"  Gaze locked       {wait}   "
+                f"holding {elapsed:.1f}s / {hold_target:.1f}s"
+            )
+        else:
+            print(f"  Gaze locked       {_badge(False)}")
+
+
 # ===================== 主流程 =====================
 def main():
     cap = open_camera()
@@ -437,10 +527,15 @@ def main():
     sysmon = SystemMonitor(interval=0.5)
     sysmon.start()
     print(f"系统监控: CPU=psutil  GPU={sysmon.gpu_source or 'N/A'}")
+    print(_c(
+        f"终端状态日志：每 {LOG_INTERVAL:.1f} 秒打印一次",
+        "cyan", "bold",
+    ))
 
     t0 = time.time()
     frames = 0
     fps_show = 0.0
+    last_log_t = 0.0
 
     while cap.isOpened():
         ret, frame = cap.read()
@@ -591,6 +686,14 @@ def main():
                 frame, big, (cx, cy),
                 cv2.FONT_HERSHEY_SIMPLEX, 1.4, (0, 0, 0), 4,
             )
+
+        # ===== 终端定期状态报告 =====
+        if time.time() - last_log_t >= LOG_INTERVAL:
+            print_status_report(
+                info, used_roi, locked, elapsed, GAZE_HOLD_SECONDS,
+                fps_show, sysmon.cpu, sysmon.gpu,
+            )
+            last_log_t = time.time()
 
         cv2.imshow("Gaze Robot (Orin Nano)", frame)
         if cv2.waitKey(1) == 27:
