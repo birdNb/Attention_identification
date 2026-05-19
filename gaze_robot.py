@@ -11,15 +11,39 @@ import subprocess
 import threading
 import time
 
+# ===== SSH/无 DISPLAY 环境自动兜底 =====
+# 当通过 SSH 连入或当前会话没有图形显示时，DISPLAY 通常为空，
+# 直接 import cv2 后调用 cv2.imshow 会因 Qt 插件无法连接 X server 而崩溃。
+# 这里在加载 cv2 之前优先把 DISPLAY 指向 Jetson 本机已经在运行的桌面 :0，
+# 让用户可以直接 `python gaze_robot.py` 启动，画面出现在 Jetson 接的显示器上。
+if not os.environ.get("DISPLAY"):
+    os.environ["DISPLAY"] = ":0"
+# Jetson 上若 XAUTHORITY 没设，使用当前用户的默认 Xauthority 文件
+if not os.environ.get("XAUTHORITY"):
+    _xauth = os.path.expanduser("~/.Xauthority")
+    if os.path.exists(_xauth):
+        os.environ["XAUTHORITY"] = _xauth
+
 import cv2
 import mediapipe as mp
+import numpy as np
 
 # ===================== 相机配置 =====================
-WIDTH, HEIGHT = 2560, 1440
-TARGET_FPS = 30
-SHOW_SIZE = (1280, 720)
+# ZED Mini 双目可选分辨率（左右拼接，单眼是其一半宽度）:
+#   4416x1242 @ 15 FPS         → 单眼 2208x1242（2.2K，最高分辨率）
+#   3840x1080 @ 30/15 FPS      → 单眼 1920x1080（1080p）
+#   2560x720  @ 60/30/15 FPS   → 单眼 1280x720（720p，性能更稳）
+#   1344x376  @ 100/60/30 FPS  → 单眼 672x376（WVGA，低延迟）
+WIDTH, HEIGHT = 4416, 1242
+TARGET_FPS = 15
 CAM_ID = 0
-USE_MJPG = True
+USE_MJPG = False  # ZED Mini 不支持 MJPG，必须 False（走 YUYV）
+ZED_STEREO = True  # ZED Mini 双目拼接，需要裁掉右半边，只用左眼
+# 给 MediaPipe 的处理图最大宽度（降采样以保证 15fps，归一化坐标不受影响）
+PROC_MAX_W = 1280
+# 显示窗口
+FULLSCREEN = True  # 是否全屏显示（等比缩放，画面外用黑边填充）
+WINDOW_NAME = "Gaze Robot (Orin Nano)"
 # ===================== 注视参数 =====================
 # 脸部朝向：偏航 (nose 相对眼睛中线的水平偏移 / 眼宽)
 YAW_TOL = 0.13
@@ -166,6 +190,45 @@ def open_camera() -> cv2.VideoCapture:
     cap.set(cv2.CAP_PROP_FPS, TARGET_FPS)
     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
     return cap
+
+
+def detect_screen_size(default=(1920, 1080)):
+    """通过 xrandr 自动检测主屏分辨率，失败时返回默认值。"""
+    try:
+        env = os.environ.copy()
+        env.setdefault("DISPLAY", ":0")
+        out = subprocess.check_output(
+            ["xrandr"], env=env, stderr=subprocess.DEVNULL, timeout=2
+        ).decode()
+        for line in out.splitlines():
+            if "*" in line:
+                token = line.strip().split()[0]  # 形如 1920x1080
+                w, h = token.split("x")
+                return int(w), int(h)
+    except Exception:
+        pass
+    return default
+
+
+def fit_letterbox(img, target_w, target_h):
+    """等比缩放到 target，多余区域填黑色（letterbox），不变形。"""
+    src_h, src_w = img.shape[:2]
+    scale = min(target_w / src_w, target_h / src_h)
+    new_w, new_h = int(src_w * scale), int(src_h * scale)
+    resized = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+    canvas = np.zeros((target_h, target_w, 3), dtype=np.uint8)
+    x = (target_w - new_w) // 2
+    y = (target_h - new_h) // 2
+    canvas[y : y + new_h, x : x + new_w] = resized
+    return canvas
+
+
+def compute_proc_size(src_w, src_h, max_w):
+    """按最大宽度等比缩放，得到给 MediaPipe 的处理图尺寸。"""
+    if src_w <= max_w:
+        return src_w, src_h
+    scale = max_w / src_w
+    return int(src_w * scale), int(src_h * scale)
 
 
 # ===================== 注视核心算法 =====================
@@ -514,14 +577,33 @@ def main():
         print("无法打开相机，请检查 CAM_ID 或线缆连接")
         return
 
-    real_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    real_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    raw_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    raw_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     real_fps = cap.get(cv2.CAP_PROP_FPS)
     fourcc_int = int(cap.get(cv2.CAP_PROP_FOURCC))
     fourcc_str = "".join([chr((fourcc_int >> 8 * i) & 0xFF) for i in range(4)])
-    print(f"相机已打开: {real_w}x{real_h} @ {real_fps:.1f} FPS  编码={fourcc_str}")
+    real_w = raw_w // 2 if ZED_STEREO else raw_w
+    real_h = raw_h
+    src_tag = "ZED-LEFT" if ZED_STEREO else "MONO"
+    print(
+        f"相机原始流: {raw_w}x{raw_h} @ {real_fps:.1f} FPS  编码={fourcc_str}"
+    )
+    print(f"实际使用: {real_w}x{real_h} ({src_tag})")
+
+    proc_w, proc_h = compute_proc_size(real_w, real_h, PROC_MAX_W)
+    print(f"MediaPipe 处理尺寸: {proc_w}x{proc_h} (PROC_MAX_W={PROC_MAX_W})")
+
+    screen_w, screen_h = detect_screen_size()
+    print(f"显示器分辨率: {screen_w}x{screen_h}  全屏={FULLSCREEN}")
     print(f"持续 {GAZE_HOLD_SECONDS:.1f} 秒注视将触发 GAZE LOCKED")
-    print("按 ESC 退出")
+    print("按 ESC 或 q 退出，按 F 切换全屏")
+
+    cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
+    if FULLSCREEN:
+        cv2.setWindowProperty(
+            WINDOW_NAME, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN
+        )
+    is_fullscreen = FULLSCREEN
 
     timer = GazeHoldTimer(GAZE_HOLD_SECONDS)
     sysmon = SystemMonitor(interval=0.5)
@@ -542,6 +624,9 @@ def main():
         if not ret:
             break
 
+        if ZED_STEREO:
+            frame = frame[:, : frame.shape[1] // 2]
+
         frames += 1
         if frames >= 10:
             now = time.time()
@@ -549,14 +634,19 @@ def main():
             t0 = now
             frames = 0
 
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        # 处理图：降采样后给 MediaPipe，归一化坐标对原图依然有效
+        if (proc_w, proc_h) != (real_w, real_h):
+            proc_bgr = cv2.resize(frame, (proc_w, proc_h))
+        else:
+            proc_bgr = frame
+        rgb = cv2.cvtColor(proc_bgr, cv2.COLOR_BGR2RGB)
         rgb.flags.writeable = False
         res = face_mesh.process(rgb)
 
         # ===== 跟丢兜底：用 Face Detection 找 ROI -> ROI 上跑 Face Mesh =====
         used_roi = False
         if ENABLE_ROI_FALLBACK and not res.multi_face_landmarks:
-            bbox = detect_face_roi(rgb, real_w, real_h)
+            bbox = detect_face_roi(rgb, proc_w, proc_h)
             if bbox is not None:
                 x1, y1, x2, y2 = bbox
                 roi = rgb[y1:y2, x1:x2].copy()
@@ -564,12 +654,16 @@ def main():
                 res = face_mesh_roi.process(roi)
                 if res.multi_face_landmarks:
                     for lms in res.multi_face_landmarks:
-                        remap_landmarks(lms, bbox, real_w, real_h)
+                        remap_landmarks(lms, bbox, proc_w, proc_h)
                     used_roi = True
 
-        frame = cv2.resize(frame, SHOW_SIZE)
-        frame.flags.writeable = True
+        # 在高清单眼图上绘图（归一化坐标 * 原图尺寸）
         h, w = frame.shape[:2]
+        # 绘图比例：以 720p 为基准等比例放大字号/线宽，避免高分辨率下文字偏小
+        draw_scale = max(1.0, h / 720.0)
+        thick1 = max(1, int(2 * draw_scale))
+        thick2 = max(2, int(3 * draw_scale))
+        circle_r = max(3, int(4 * draw_scale))
 
         info = None
         if res.multi_face_landmarks:
@@ -585,10 +679,13 @@ def main():
                 )
 
                 fx1, fy1, fx2, fy2 = face_bbox(lm, w, h, pad=12)
-                cv2.rectangle(frame, (fx1, fy1), (fx2, fy2), face_color, 2)
+                cv2.rectangle(
+                    frame, (fx1, fy1), (fx2, fy2), face_color, thick1,
+                )
                 cv2.putText(
                     frame, "Face", (fx1, max(0, fy1 - 8)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, face_color, 2,
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7 * draw_scale, face_color,
+                    thick1,
                 )
 
                 lex1, ley1, lex2, ley2 = bbox_from_indices(
@@ -598,18 +695,18 @@ def main():
                     lm, RIGHT_EYE_IDX, w, h, pad=6,
                 )
                 cv2.rectangle(
-                    frame, (lex1, ley1), (lex2, ley2), pupil_color, 2,
+                    frame, (lex1, ley1), (lex2, ley2), pupil_color, thick1,
                 )
                 cv2.rectangle(
-                    frame, (rex1, rey1), (rex2, rey2), pupil_color, 2,
+                    frame, (rex1, rey1), (rex2, rey2), pupil_color, thick1,
                 )
 
                 lx = int(lm.landmark[LEFT_PUPIL].x * w)
                 ly = int(lm.landmark[LEFT_PUPIL].y * h)
                 rx = int(lm.landmark[RIGHT_PUPIL].x * w)
                 ry = int(lm.landmark[RIGHT_PUPIL].y * h)
-                cv2.circle(frame, (lx, ly), 4, pupil_color, -1)
-                cv2.circle(frame, (rx, ry), 4, pupil_color, -1)
+                cv2.circle(frame, (lx, ly), circle_r, pupil_color, -1)
+                cv2.circle(frame, (rx, ry), circle_r, pupil_color, -1)
 
         instant_looking = bool(info and info["looking"])
         elapsed, locked = timer.update(instant_looking)
@@ -636,8 +733,8 @@ def main():
             status_color = (0, 0, 255)
 
         cv2.putText(
-            frame, status_text, (20, 40),
-            cv2.FONT_HERSHEY_SIMPLEX, 1.0, status_color, 3,
+            frame, status_text, (20, int(40 * draw_scale)),
+            cv2.FONT_HERSHEY_SIMPLEX, 1.0 * draw_scale, status_color, thick2,
         )
 
         # ===== 右上角：FPS / CPU / GPU =====
@@ -652,9 +749,9 @@ def main():
                 f"CPU: {sysmon.cpu:5.1f}%",
                 gpu_text,
             ],
-            scale=0.7,
+            scale=0.7 * draw_scale,
             color=(0, 255, 0),
-            thickness=2,
+            thickness=thick1,
         )
 
         # ===== 调试信息（小字） =====
@@ -667,24 +764,27 @@ def main():
             )
             cv2.putText(
                 frame, debug, (20, h - 20),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2,
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6 * draw_scale,
+                (255, 255, 255), thick1,
             )
 
         # ===== 大字标识：锁定时居中显示 =====
         if locked:
             big = "LOOKING AT CAMERA"
+            big_scale = 1.4 * draw_scale
+            big_thick = max(3, int(4 * draw_scale))
             (tw, th), _ = cv2.getTextSize(
-                big, cv2.FONT_HERSHEY_SIMPLEX, 1.4, 4,
+                big, cv2.FONT_HERSHEY_SIMPLEX, big_scale, big_thick,
             )
             cx = (w - tw) // 2
-            cy = h - 60
+            cy = h - int(60 * draw_scale)
             cv2.rectangle(
                 frame, (cx - 15, cy - th - 15), (cx + tw + 15, cy + 15),
                 (0, 255, 0), -1,
             )
             cv2.putText(
                 frame, big, (cx, cy),
-                cv2.FONT_HERSHEY_SIMPLEX, 1.4, (0, 0, 0), 4,
+                cv2.FONT_HERSHEY_SIMPLEX, big_scale, (0, 0, 0), big_thick,
             )
 
         # ===== 终端定期状态报告 =====
@@ -695,9 +795,19 @@ def main():
             )
             last_log_t = time.time()
 
-        cv2.imshow("Gaze Robot (Orin Nano)", frame)
-        if cv2.waitKey(1) == 27:
+        # 全屏 letterbox 显示（等比缩放到屏幕，不变形）
+        show = fit_letterbox(frame, screen_w, screen_h)
+        cv2.imshow(WINDOW_NAME, show)
+        key = cv2.waitKey(1) & 0xFF
+        if key == 27 or key == ord("q"):
             break
+        if key == ord("f"):
+            is_fullscreen = not is_fullscreen
+            cv2.setWindowProperty(
+                WINDOW_NAME,
+                cv2.WND_PROP_FULLSCREEN,
+                cv2.WINDOW_FULLSCREEN if is_fullscreen else cv2.WINDOW_NORMAL,
+            )
 
     sysmon.stop()
     cap.release()
